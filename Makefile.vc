@@ -1,0 +1,37 @@
+
+BOINC_BASE = \Work\GitHub\boinc-v2
+
+CPPFLAGS = $(CPPFLAGS) -nologo -c -O1 -GS- -W4
+CPPFLAGS = $(CPPFLAGS) -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE
+!ifdef VERBOSE
+CPPFLAGS = $(CPPFLAGS) -DVERBOSE
+!endif
+LINKCMD = cl -nologo -Fm -Fe$@ $**
+LINKCMD = $(LINKCMD) /link /DYNAMICBASE:NO
+
+# MSVC2010 sets this for 64-bit command prompt. If not, define it on MAKE's command line.
+!if "$(PLATFORM)" == "X64"
+
+obj = output_w64
+exe = srw_64.exe
+BOINC_LIB  = $(BOINC_BASE)/win_build/Build/x64/Release
+
+!else
+
+obj = output_w32
+exe = srw_32.exe
+BOINC_LIB  = $(BOINC_BASE)/win_build/Build/Win32/Release
+
+!endif
+
+all: $(obj) $(exe)
+
+$(obj):
+	md $@
+
+$(exe): $(obj)/wrapper.obj
+	$(LINKCMD) $(BOINC_LIB)/libboincapi_staticcrt.LIB $(BOINC_LIB)/libboinc_staticcrt.LIB USER32.LIB ADVAPI32.LIB SHELL32.LIB
+
+$(obj)/wrapper.obj: wrapper.cpp
+	$(CC) $(CPPFLAGS) -I$(BOINC_BASE)/api -I$(BOINC_BASE)/lib -Fo$@ $**
+
