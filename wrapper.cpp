@@ -186,7 +186,6 @@ static void poll_child_stdout()
             end = buf + sizeof(buf) - 1;
         if (end)
         {
-            static const char status_pattern[] = " factors, ";
             char *pat;
 
             // got complete line
@@ -201,9 +200,12 @@ static void poll_child_stdout()
                 // ignore it
             }
             // status line: p=110499161, 1000564 p/sec, 47 factors, 10.5% done, ...
-            else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) && (pat = strstr(buf, status_pattern)) != NULL)
+            // status line: p=110499161, 1000564 p/sec, 1 factor, 10.5% done, ...  (ouch...)
+            else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) &&
+                     ( (pat = strstr(buf, " factors, ")) != NULL || (pat = strstr(buf, " factor, ")) != NULL )
+                    )
             {
-                pat += sizeof(status_pattern) - 1;
+                pat = strchr(pat, ',') + 2;   // guaranteed to be non-NULL, patterns above always ends with comma and space
                 ratio_done     = atof(pat) / 100;
                 status_updated = true;
 #ifdef VERBOSE
