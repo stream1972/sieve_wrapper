@@ -1,25 +1,16 @@
-#include <stdio.h>
-#include <vector>
-#include <string>
-#include <fstream>
-#include <iostream>
-#ifdef _WIN32
-#include <windows.h>
-#include <tchar.h>
-#include "boinc_win.h"
-#else
-#include <unistd.h>
-#include <sys/wait.h>
-#endif
-
 #include "boinc_api.h"
 #include "diagnostics.h"
 #include "filesys.h"
-#include "parse.h"
 #include "util.h"
-#include "str_util.h"
 #include "error_numbers.h"
 #include "proc_control.h"
+
+#ifdef _WIN32
+// Nothing extra yet
+#else
+#include <sys/stat.h>
+#include <sys/wait.h>
+#endif
 
 using namespace std;
 
@@ -183,7 +174,10 @@ static void poll_child_stdout()
         char *end = strpbrk(buf, "\r\n");
         // if no \n but buffer is full, accept it as truncated string
         if (end == NULL && len >= sizeof(buf)-1)
+        {
+            len = sizeof(buf);  // for correct purge of last zero below
             end = buf + sizeof(buf) - 1;
+        }
         if (end)
         {
             char *pat;
@@ -249,7 +243,7 @@ static void poll_child_stdout()
         DWORD gotBytes;
         if (!ReadFile(hChildStdoutRd, buf + len, sizeof(buf)-len-1, &gotBytes, NULL))
         {
-            fprintf(stderr, "pipe ReadFile(): error %u\n", GetLastError());
+            fprintf(stderr, "pipe ReadFile(): error 0x%lx\n", GetLastError());
             closed = true;
             break;
         }
@@ -283,7 +277,7 @@ static void poll_checkpoint_file(bool report)
 static bool poll_application(int& status)
 {
 #ifdef _WIN32
-    unsigned long exit_code;
+    DWORD exit_code;
     if (GetExitCodeProcess(pid_handle, &exit_code))
     {
         if (exit_code != STILL_ACTIVE)
@@ -507,7 +501,12 @@ int main(int argc, char** argv)
     if (boinc_file_exists(factors_file))
     {
         fprintf(stderr, "Factors file found\n");
-        boinc_copy(factors_file, sResultFile.c_str());
+        retval = boinc_copy(factors_file, sResultFile.c_str());
+        if (retval)
+        {
+            fprintf(stderr, "can't copy factors: %d\n", retval);
+            status = retval;
+        }
     }
     else
     {
