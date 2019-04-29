@@ -8,8 +8,11 @@
 #ifdef _WIN32
 // Nothing extra yet
 #else
-#include <sys/stat.h>
-#include <sys/wait.h>
+#include <sys/stat.h>     // stat()
+#include <sys/wait.h>     // waitpid()
+#include <sys/resource.h> // setpriority() flags
+#include <unistd.h>       // read()
+#include <fcntl.h>        // fcntl()
 #endif
 
 using namespace std;
@@ -19,7 +22,8 @@ static DWORD  pid;
 static HANDLE pid_handle, thread_handle;
 static HANDLE hChildStdoutRd;
 #else
-static int pid;
+static pid_t pid;
+static int   hChildStdoutRd;
 #endif
 static bool app_suspended;
 
@@ -80,13 +84,21 @@ static int run_application(void)
 
     string arguments;
     unsigned u;
+
+    // Must have argv[0] in arguments for both Windows and Linux
+    arguments = quote_spaces(sMainProgram);
+    // Append extra command line
     for (u = 0; u < vs_ExtraParams.size(); u++)
     {
-        if (!arguments.empty())
-            arguments += " ";
+        arguments += " ";
         arguments += vs_ExtraParams[u];
     }
-    fprintf(stderr, "running %s %s\n", sMainProgram.c_str(), arguments.c_str());
+    fprintf(stderr, "running %s\n", arguments.c_str());
+
+    // The Unicode version of CreateProcessW can modify the contents of lpCommandLine.
+    // parse_command_line() from Boinc library WILL modify argument string.
+    // So make a copy.
+    char *args = strdup(arguments.c_str());
 
 #ifdef _WIN32
     PROCESS_INFORMATION process_info;
@@ -118,12 +130,6 @@ static int run_application(void)
     startup_info.hStdOutput = hChildStdoutWr;
     startup_info.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
 
-    // Must set argv[0] in arguments
-    arguments = quote_spaces(sMainProgram) + " " + arguments;
-    // The Unicode version of this function, CreateProcessW, can modify the contents
-    // of lpCommandLine, so make a copy
-    char *args = strdup(arguments.c_str());
-
     if (!CreateProcess(
         sMainProgram.c_str(),
         args,
@@ -144,21 +150,80 @@ static int run_application(void)
     pid_handle    = process_info.hProcess;
     thread_handle = process_info.hThread;
 #else
-    int retval;
-    char progname[256], buf[256];
+    // Parse command line (with quotes) and build array of arguments
+    #define MAX_ARGS_ARRAY_SIZE 256
+    static char *args_array[MAX_ARGS_ARRAY_SIZE];
+    int cnt;
+    // Danger: Boinc lib function do not check array size
+    cnt = parse_command_line(args, args_array);
+    if (cnt >= MAX_ARGS_ARRAY_SIZE)  // buffer overrun. quit asap if not dead yet
+        _exit(EXIT_OUT_OF_MEMORY);
+
+#ifdef VERBOSE
+    int i;
+    for (i = 0; i < cnt; i++)
+        fprintf(stderr, "[%d] = [%s]\n", i, args_array[i]);
+#endif
+
+    // Create handles to redirect output
+    int fd_out[2];
+    if (pipe(fd_out) < 0)
+    {
+        perror("can't pipe");
+        return ERR_PIPE;
+    }
     pid = fork();
-    if (pid == -1) {
-        boinc_finish(ERR_FORK);
+    if (pid == -1)
+    {
+        perror("can't fork");
+        return ERR_FORK;
     }
-    if (pid == 0) {
-        strcpy(progname, application.c_str ());
-        boinc_resolve_filename(progname, buf, sizeof(buf));
-        argv[0] = buf;
-        retval = execv(buf, argv);
-        exit(ERR_EXEC);
+    if (pid == 0)  // child
+    {
+        // redirect stdout to pipe (stderr still goes to stderr.txt)
+        close(fd_out[0]);
+        if (dup2(fd_out[1], STDOUT_FILENO) == -1)
+            perror("dup2 in child");
+        if (setpriority(PRIO_PROCESS, 0, PROCESS_IDLE_PRIORITY) == -1)
+            perror("setpriority in child");
+        execv(sMainProgram.c_str(), args_array);
+        // can be here only if exec failed
+        perror("exec in child");
+        exit(EXIT_CHILD_FAILED);
     }
+
+    // parent. save handle to read end of pipe
+    hChildStdoutRd = fd_out[0];
+    close(fd_out[1]);
+
+    // set read end of pipe to non-blocking mode
+    int flags = fcntl(hChildStdoutRd, F_GETFL);
+    if (flags == -1)
+        perror("fcntl(get)");
+    else if (fcntl(hChildStdoutRd, F_SETFL, flags | O_NONBLOCK) == -1)
+        perror("fcntl(set)");
 #endif
     return 0;
+}
+
+//
+// on error, return false and keep old cpu_time
+//
+static bool get_child_cpu_time(double& cpu_time)
+{
+    double t;
+#ifdef _WIN32
+    // return -1 on error
+    if (boinc_process_cpu_time(pid_handle, t) < 0)
+        return false;
+#else
+    // return zero time on error
+    t = linux_cpu_time(pid);
+    if (t == 0)
+        return false;
+#endif
+    cpu_time = t;
+    return true;
 }
 
 static void poll_child_stdout()
@@ -231,16 +296,15 @@ static void poll_child_stdout()
         // append more data from pipe, if possible
         if (closed)
             break;
-        DWORD child_stdout = 0;
-        if (!PeekNamedPipe(hChildStdoutRd, NULL, 0, NULL, &child_stdout, NULL))
+#ifdef _WIN32
+        DWORD gotBytes = 0;
+        if (!PeekNamedPipe(hChildStdoutRd, NULL, 0, NULL, &gotBytes, NULL))
         {
             closed = true; // child process terminated
             break;
         }
-        if (!child_stdout) // no data available
+        if (!gotBytes) // no data available
             break;
-
-        DWORD gotBytes;
         if (!ReadFile(hChildStdoutRd, buf + len, sizeof(buf)-len-1, &gotBytes, NULL))
         {
             fprintf(stderr, "pipe ReadFile(): error 0x%lx\n", GetLastError());
@@ -248,6 +312,23 @@ static void poll_child_stdout()
             break;
         }
         len += gotBytes;
+#else
+        ssize_t gotBytes;
+        gotBytes = read(hChildStdoutRd, buf + len, sizeof(buf)-len-1);
+        if (gotBytes < 0)   // error
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)  // really, no data yet
+                gotBytes = 0;
+            else
+            {
+                perror("pipe read");
+                closed = true;
+            }
+        }
+        if (gotBytes <= 0)  // error or no data available
+            break;
+        len += gotBytes;
+#endif
         // back to parsing loop
     }
 }
@@ -265,7 +346,7 @@ static void poll_checkpoint_file(bool report)
         last_time = st.st_mtime;
         if (report)
         {
-            boinc_process_cpu_time(pid_handle, checkpoint_offset);
+            get_child_cpu_time(checkpoint_offset);
             status_updated = true;
 #ifdef VERBOSE
             fprintf(stderr, "App checkpointed at %f\n", checkpoint_offset);
@@ -280,21 +361,24 @@ static bool poll_application(int& status)
     DWORD exit_code;
     if (GetExitCodeProcess(pid_handle, &exit_code))
     {
-        if (exit_code != STILL_ACTIVE)
-        {
-            status = exit_code;
-            return true;
-        }
+        if (exit_code == STILL_ACTIVE)
+            return false;
+        status = exit_code;
+        return true;
     }
 #else
-    int wpid, stat;
+    pid_t wpid;
+    int   stat;
     wpid = waitpid(pid, &stat, WNOHANG);
-    if (wpid)
+    if (wpid == 0)
+        return false;
+    if (wpid > 0)
     {
-        status = stat;
+        status = WEXITSTATUS(stat);
         return true;
     }
 #endif
+    // Cannot get status. May be do something here.
     return false;
 }
 
@@ -366,9 +450,9 @@ static void send_status_message()
 {
     if (status_updated && ratio_done >= 0)
     {
-        double session_time;
+        static double session_time;  // keep old time on error
 
-        boinc_process_cpu_time(pid_handle, session_time);
+        get_child_cpu_time(session_time);  // unchanged on error
         boinc_report_app_status(initial_cpu_time + session_time,
                                 initial_cpu_time + checkpoint_offset,
                                 ratio_done
