@@ -395,18 +395,25 @@ static void stop_app()
 }
 
 // kill this task (gracefully if possible) and any other subprocesses
+// Linux Boinc lib sends SIGTERM, it's OK for sr2sieve
 static void kill_app()
 {
     fprintf(stderr, "Killing\n");
 #ifdef _WIN32
     kill_descendants();
 #else
+    // be sure that app is not SIGSTOP'ed and signal handlers could run for graceful shutdown
+    if (app_suspended)
+        resume_app();
     kill_descendants(pid);
 #endif
     poll_child_stdout();   // get remaining messages for logging
+    // sr2sieve bug: no output after signal if stdout is redirected, only console works.
+    // easy to confirm with 'sr2sieve ... >file' and Ctrl-C
 }
 
 // MUST kill app gracefully for correct shutdown and checkpointing
+// For sr2sieve, it's OK to use kill_app() (SIGTERM)
 static void terminate_app()
 {
     kill_app();
@@ -432,7 +439,7 @@ static void poll_boinc_messages()
     {
         fprintf(stderr, "Terminating - abort request\n");
         kill_app();
-        exit(0);
+        exit(EXIT_ABORTED_BY_CLIENT);
     }
     if ( status.suspended && !app_suspended)
     {
