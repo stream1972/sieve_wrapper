@@ -29,11 +29,14 @@ static bool app_suspended;
 
 static double ratio_done = -1.0;   // negative mean unknown
 static double initial_cpu_time;
+static double final_cpu_time;      // optional, obtained when app terminates
 static double checkpoint_offset;   // when app checkpointed (in this session)
 static bool   status_updated;      // must report new info
 static bool   range_complete;
 
 static vector<string> vs_ExtraParams;
+
+static void send_status_message();
 
 static string quote_spaces(string s)
 {
@@ -212,18 +215,55 @@ static int run_application(void)
 static bool get_child_cpu_time(double& cpu_time)
 {
     double t;
+
+    // If child terminated, try to use his final CPU time, if known
+    if (final_cpu_time)
+    {
+        cpu_time = final_cpu_time;
+        return true;
+    }
+
 #ifdef _WIN32
     // return -1 on error
     if (boinc_process_cpu_time(pid_handle, t) < 0)
         return false;
-#else
+#elif defined(__linux__)
     // return zero time on error
     t = linux_cpu_time(pid);
     if (t == 0)
         return false;
+#elif defined(__APPLE__)
+    // There's no easy way to get another process's CPU time in Mac OS X?
+    // Report runtime, it's better then nothing.
+    t = boinc_elapsed_time();
+#else
+#error How to get child CPU time for your OS?
 #endif
     cpu_time = t;
     return true;
+}
+
+//
+// If possible, get final CPU time of exited process
+// (this is a only way to report true CPU time on Mac)
+//
+static void get_final_cpu_time()
+{
+#ifdef _WIN32
+    // nothing. no graceful termination anyway
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) < 0)
+        perror("getrusage");
+    else
+    {
+        final_cpu_time = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec +
+            ((double)ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6;
+#ifdef VERBOSE
+        fprintf(stderr, "Final CPU time set to %f\n", final_cpu_time);
+#endif
+    }
+#endif
 }
 
 static void poll_child_stdout()
@@ -258,21 +298,32 @@ static void poll_child_stdout()
             {
                 // ignore it
             }
-            // status line: p=110499161, 1000564 p/sec, 47 factors, 10.5% done, ...
-            // status line: p=110499161, 1000564 p/sec, 1 factor, 10.5% done, ...  (ouch...)
+            // status lines
+            // p=11449790522095243, 2198332 p/sec, 0 factors, 99.9% cpu, ETA 03 May 13:45
+            // p=11449790260702471, 2197347 p/sec, 0 factors, 2.6% done, ETA 03 May 13:43
+            // p=110499161, 1000564 p/sec, 47 factors, 10.5% done, ...
+            // p=110499161, 1000564 p/sec, 1 factor, 10.5% done, ...  (ouch...)
             else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) &&
-                     ( (pat = strstr(buf, " factors, ")) != NULL || (pat = strstr(buf, " factor, ")) != NULL )
+                     (pat = strstr(buf, "% done, ")) != NULL
                     )
             {
-                pat = strchr(pat, ',') + 2;   // guaranteed to be non-NULL, patterns above always ends with comma and space
+                do { --pat; } while (pat != buf && *pat != ' ');  // scan back to the whitespace
+                pat++;  // skip whitespace
                 ratio_done     = atof(pat) / 100;
                 status_updated = true;
 #ifdef VERBOSE
                 fprintf(stderr, "done: %f\n", ratio_done);
 #endif
             }
+            else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) && strstr(buf, "% cpu, "))
+            {
+                // status line with CPU usage (see above), ignore it
+            }
             else
             {
+                // everything else copied to our stderr log
+                fprintf(stderr, "%s\n", buf);
+                // extra postprocessing
                 if (strstr(buf, "because range is complete"))
                 {
                     fprintf(stderr, "Detected range complete\n");
@@ -280,8 +331,6 @@ static void poll_child_stdout()
                     ratio_done     = 1.0;
                     status_updated = true;
                 }
-                // everything else copied to our stderr log
-                fprintf(stderr, "%s\n", buf);
             }
 
             // remove processed portion of string
@@ -375,6 +424,7 @@ static bool poll_application(int& status)
     if (wpid > 0)
     {
         status = WEXITSTATUS(stat);
+        get_final_cpu_time();
         return true;
     }
 #endif
@@ -407,7 +457,12 @@ static void kill_app()
         resume_app();
     kill_descendants(pid);
 #endif
+
+    get_final_cpu_time();  // get final CPU time of terminated app
     poll_child_stdout();   // get remaining messages for logging
+    poll_checkpoint_file(true);
+    send_status_message(); // if app checkpointed on exit, send new info
+
     // sr2sieve bug: no output after signal if stdout is redirected, only console works.
     // easy to confirm with 'sr2sieve ... >file' and Ctrl-C
 }
@@ -570,7 +625,7 @@ int main(int argc, char** argv)
 
         terminated = poll_application(status);
 
-        // even if terminated, get remaining app output and send messages
+        // even if terminated, get remaining app output and send message with final CPU time
         poll_child_stdout();
         poll_checkpoint_file(true);
         send_status_message();
