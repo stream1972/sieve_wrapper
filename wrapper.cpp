@@ -586,7 +586,7 @@ int main(int argc, char** argv)
         BOINC_DIAG_REDIRECTSTDERR
     );
 
-    fprintf(stderr, "BOINC sr2sieve wrapper 2.00\n");
+    fprintf(stderr, "BOINC sr2sieve wrapper 2.00 (" __DATE__ " " __TIME__ ")\n");
 
     memset(&options, 0, sizeof(options));
     options.main_program = true;
