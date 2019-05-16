@@ -21,6 +21,9 @@ BOINC_LIB  = $(BOINC_BASE)/win_build/Build/x64/Release
 obj = output_w32
 exe = srw_32.exe
 BOINC_LIB  = $(BOINC_BASE)/win_build/Build/Win32/Release
+# This will make program built with VC2010 compatible with Windows 2000
+EXTRA_OBJ  = $(obj)/vc2010_w2k.obj
+LINKCMD    = $(LINKCMD) /SUBSYSTEM:CONSOLE,5.00
 
 !endif
 
@@ -29,9 +32,16 @@ all: $(obj) $(exe)
 $(obj):
 	md $@
 
-$(exe): $(obj)/wrapper.obj
+$(exe): $(obj)/wrapper.obj $(EXTRA_OBJ)
 	$(LINKCMD) $(BOINC_LIB)/libboincapi_staticcrt.LIB $(BOINC_LIB)/libboinc_staticcrt.LIB USER32.LIB ADVAPI32.LIB SHELL32.LIB
 
 $(obj)/wrapper.obj: wrapper.cpp
 	$(CC) $(CPPFLAGS) -I$(BOINC_BASE)/api -I$(BOINC_BASE)/lib -Fo$@ $**
 
+$(obj)/vc2010_w2k.obj: vc2010_w2k.asm
+	ml /nologo /c -Fo$@ $**
+
+clean:
+	-if exist $(obj)\*.obj del $(obj)\*.obj
+	-if exist *.map del *.map
+	-if exist *.exe del *.exe
