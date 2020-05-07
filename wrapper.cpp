@@ -19,11 +19,11 @@ using namespace std;
 
 #ifdef _WIN32
 static DWORD  pid;
-static HANDLE pid_handle, thread_handle;
-static HANDLE hChildStdoutRd;
+static HANDLE pid_handle;
+static HANDLE hChildStdoutRd = INVALID_HANDLE_VALUE;
 #else
 static pid_t pid;
-static int   hChildStdoutRd;
+static int   hChildStdoutRd = -1;
 #endif
 static bool app_suspended;
 
@@ -32,11 +32,65 @@ static double initial_cpu_time;
 static double final_cpu_time;      // optional, obtained when app terminates
 static double checkpoint_offset;   // when app checkpointed (in this session)
 static bool   status_updated;      // must report new info
+static unsigned num_threads;       // set by Boinc for multi-threaded apps
 static bool   range_complete;
 
 static vector<string> vs_ExtraParams;
 
+//
+// Abstract application interface
+//
+class WRAPPER_FUNCTIONS
+{
+public:
+    // Get name of program to run. Function must set 'sMainProgram'.
+    // Optionally, extra arguments could be appended to global 'vs_ExtraParams'.
+    virtual void get_application_name(string &sMainProgram) = 0;
+
+    // Parse one line of child output.
+    // Return true if line should be copied to task stderr, false to hide it (noise or should not be seen by user)
+    virtual bool parse_child_stdout_line(char *buf) = 0;
+
+    // Get timestamp (usually st_mtime) of checkpoint file for apps which do checkpointing in background.
+    // Return 0 if not supported, unknown, or checkpoint state in unconsistent
+    virtual time_t get_checkpoint_timestamp(void) = 0;
+
+    // Task finished. Postprocess result files (check, copy to destination, etc.).
+    // 'status' is current error code. Function can set it if fatal error occured
+    // and task must be aborted, otherwise it must be kept unchanged.
+    virtual void postprocess_results(int &status) = 0;
+
+};
+
 static void send_status_message();
+static int  execute_program(string sMainProgram, vector<string> &vs_ExtraParams);
+static void execute_cleanup(void);
+static bool poll_application(int& status, bool main_program);
+static void poll_child_stdout(WRAPPER_FUNCTIONS *methods);
+
+//
+// Specific application interfaces
+//
+class SIEVE_FUNCTIONS : public WRAPPER_FUNCTIONS
+{
+public:
+    void   get_application_name(string &sMainProgram);
+    bool   parse_child_stdout_line(char *buf);
+    time_t get_checkpoint_timestamp(void);
+    void   postprocess_results(int &status);
+};
+
+class LLR2_FUNCTIONS : public WRAPPER_FUNCTIONS
+{
+public:
+    void   get_application_name(string &sMainProgram);
+    bool   parse_child_stdout_line(char *buf);
+    time_t get_checkpoint_timestamp(void);
+    void   postprocess_results(int & /* status */) { };
+};
+
+static SIEVE_FUNCTIONS methods_sieve;
+static LLR2_FUNCTIONS  methods_llr2;
 
 static string quote_spaces(string s)
 {
@@ -45,9 +99,9 @@ static string quote_spaces(string s)
     return "\"" + s + "\"";
 }
 
-static int run_application(void)
+void SIEVE_FUNCTIONS::get_application_name(string &sMainProgram)
 {
-    string sInputFile, sMainProgram;
+    string sInputFile;
 
     // required - main program
     // a) old style executable (for compatibility with old tasks, could be removed later)
@@ -84,7 +138,64 @@ static int run_application(void)
         vs_ExtraParams.push_back("-i");
         vs_ExtraParams.push_back(quote_spaces(sInputFile));
     }
+}
 
+void LLR2_FUNCTIONS::get_application_name(string &sMainProgram)
+{
+    char buf[128];
+
+    boinc_resolve_filename_s("llr2", sMainProgram);
+
+    vs_ExtraParams.push_back("-d");  // -d is mandatory, even if not sent by server
+
+    if (num_threads)
+    {
+        sprintf(buf, "-t%u", num_threads);
+        vs_ExtraParams.push_back(buf);
+    }
+
+    // LLR checkpoint interval
+    APP_INIT_DATA aid;
+    boinc_get_init_data(aid);
+    unsigned cp = aid.checkpoint_period >= 1 ? (unsigned)aid.checkpoint_period : DEFAULT_CHECKPOINT_PERIOD;
+    sprintf(buf, "-oDiskWriteTime=%u", (cp + 59) / 60);
+    vs_ExtraParams.push_back(buf);
+
+
+    // Get LLR version first (run "llr -v" and save output)
+    vector<string> params;
+    int status;
+
+    params.push_back("-v");
+    if ((status = execute_program(sMainProgram, params)) == 0)
+    {
+        for (;;)
+        {
+            bool terminated;
+
+            terminated = poll_application(status, false);
+            poll_child_stdout(this); // even if terminated, get remaining app output
+            if (terminated)
+                break;
+            boinc_sleep(0.1);
+        }
+        execute_cleanup();
+    }
+    else
+        fprintf(stderr, "can't get LLR version: %d\n", status);
+}
+
+static int run_application(WRAPPER_FUNCTIONS *methods)
+{
+    string sMainProgram;
+
+    methods->get_application_name(sMainProgram);
+
+    return execute_program(sMainProgram, vs_ExtraParams);
+}
+
+static int execute_program(string sMainProgram, vector<string> &vs_ExtraParams)
+{
     string arguments;
     unsigned u;
 
@@ -151,7 +262,7 @@ static int run_application(void)
     free(args);
     pid           = process_info.dwProcessId;
     pid_handle    = process_info.hProcess;
-    thread_handle = process_info.hThread;
+    CloseHandle(process_info.hThread);  // not required
 #else
     // Parse command line (with quotes) and build array of arguments
     #define MAX_ARGS_ARRAY_SIZE 256
@@ -207,6 +318,18 @@ static int run_application(void)
         perror("fcntl(set)");
 #endif
     return 0;
+}
+
+//
+// Delayed cleanup after child termination.
+//
+static void execute_cleanup(void)
+{
+#ifdef _WIN32
+        // On Windows, process handle must be closed.
+        // Delayed because it's used in get_cpu_time() even after termination.
+        CloseHandle(pid_handle);
+#endif
 }
 
 //
@@ -266,9 +389,111 @@ static void get_final_cpu_time()
 #endif
 }
 
-static void poll_child_stdout()
+bool SIEVE_FUNCTIONS::parse_child_stdout_line(char *buf)
 {
-    static bool closed;
+    char *pat;
+
+    if (isdigit(*buf) && strstr(buf, " | ") && strchr(buf, '^')) // factor, like "109037563 | 3*2^41396435-1"
+    {
+        // ignore it
+    }
+    // status lines
+    // p=11449790522095243, 2198332 p/sec, 0 factors, 99.9% cpu, ETA 03 May 13:45
+    // p=11449790260702471, 2197347 p/sec, 0 factors, 2.6% done, ETA 03 May 13:43
+    // p=110499161, 1000564 p/sec, 47 factors, 10.5% done, ...
+    // p=110499161, 1000564 p/sec, 1 factor, 10.5% done, ...  (ouch...)
+    else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) &&
+             (pat = strstr(buf, "% done, ")) != NULL
+            )
+    {
+        do { --pat; } while (pat != buf && *pat != ' ');  // scan back to the whitespace
+        pat++;  // skip whitespace
+        ratio_done     = atof(pat) / 100;
+        status_updated = true;
+#ifdef VERBOSE
+        fprintf(stderr, "done: %f\n", ratio_done);
+#endif
+    }
+    else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) && strstr(buf, "% cpu, "))
+    {
+        // status line with CPU usage (see above), ignore it
+    }
+    else
+    {
+        // extra postprocessing
+        if (strstr(buf, "because range is complete"))
+        {
+            fprintf(stderr, "Detected range complete\n");
+            range_complete = true;
+            ratio_done     = 1.0;
+            status_updated = true;
+        }
+        // everything else copied to our stderr log
+        return true;
+    }
+    // hide this line
+    return false;
+}
+
+bool LLR2_FUNCTIONS::parse_child_stdout_line(char *buf)
+{
+    // LLR uses spaces to cleanup lines on screen, skip them and ignore such lines
+    while (isspace(*buf)) buf++;
+    if (*buf == 0) return false;
+
+    // Status line
+    // 27*2^785264+1, bit: 580000 / 785263 [73.86%], 537251 checked.  Time per bit: 0.184 ms.
+    // Resuming Proth prime test of 27*2^785264+1 at bit 781457 [99.51%]
+    bool keep_status = false;
+    char *p = strstr(buf, " bit: ");
+    if (p == NULL)
+    {
+        keep_status = true;
+        p = strstr(buf, "Resuming ");
+    }
+    if (p)
+    {
+        for (; *p; p++)
+        {
+            if (*p == '[' && (isdigit(p[1]) || p[1] == '.'))
+            {
+                ratio_done = atof(p+1) / 100;
+                status_updated = true;
+#ifdef VERBOSE
+                fprintf(stderr, "done: %f\n", ratio_done);
+#endif
+                return keep_status;
+            }
+        }
+    }
+
+    // Hide residues and primes (print own message)
+    if ( strstr(buf, "RES64") || strstr(buf, " is prime!") || (strstr(buf, " is ") && strstr(buf, " PRP! ")) )
+    {
+        fprintf(stderr, "Testing complete.\n");
+        ratio_done     = 1.0;
+        status_updated = true;
+        return false;
+    }
+
+    // Strings which are part of prime testing and may reveal a prime
+    static const char * const strings[] =
+    {
+        "(Factorized part = ",
+        "Candidate saved in file ",
+        NULL
+    };
+    for (const char * const *p = strings; *p; p++)
+    {
+        if (strstr(buf, *p) == buf)
+            return false;
+    }
+
+    return true;
+}
+
+static void poll_child_stdout(WRAPPER_FUNCTIONS *methods)
+{
     static char buf[512];
     static unsigned len;
 
@@ -285,8 +510,6 @@ static void poll_child_stdout()
         }
         if (end)
         {
-            char *pat;
-
             // got complete line
             *end = 0;
             // parse line contents
@@ -294,43 +517,10 @@ static void poll_child_stdout()
             {
                 // empty line, ignored
             }
-            else if (isdigit(*buf) && strstr(buf, " | ") && strchr(buf, '^')) // factor, like "109037563 | 3*2^41396435-1"
-            {
-                // ignore it
-            }
-            // status lines
-            // p=11449790522095243, 2198332 p/sec, 0 factors, 99.9% cpu, ETA 03 May 13:45
-            // p=11449790260702471, 2197347 p/sec, 0 factors, 2.6% done, ETA 03 May 13:43
-            // p=110499161, 1000564 p/sec, 47 factors, 10.5% done, ...
-            // p=110499161, 1000564 p/sec, 1 factor, 10.5% done, ...  (ouch...)
-            else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) &&
-                     (pat = strstr(buf, "% done, ")) != NULL
-                    )
-            {
-                do { --pat; } while (pat != buf && *pat != ' ');  // scan back to the whitespace
-                pat++;  // skip whitespace
-                ratio_done     = atof(pat) / 100;
-                status_updated = true;
-#ifdef VERBOSE
-                fprintf(stderr, "done: %f\n", ratio_done);
-#endif
-            }
-            else if (buf[0] == 'p' && buf[1] == '=' && isdigit(buf[2]) && strstr(buf, "% cpu, "))
-            {
-                // status line with CPU usage (see above), ignore it
-            }
-            else
+            else if (methods->parse_child_stdout_line(buf))
             {
                 // everything else copied to our stderr log
                 fprintf(stderr, "%s\n", buf);
-                // extra postprocessing
-                if (strstr(buf, "because range is complete"))
-                {
-                    fprintf(stderr, "Detected range complete\n");
-                    range_complete = true;
-                    ratio_done     = 1.0;
-                    status_updated = true;
-                }
             }
 
             // remove processed portion of string
@@ -343,13 +533,14 @@ static void poll_child_stdout()
         }
 
         // append more data from pipe, if possible
-        if (closed)
-            break;
 #ifdef _WIN32
+        if (hChildStdoutRd == INVALID_HANDLE_VALUE)
+            break;
         DWORD gotBytes = 0;
         if (!PeekNamedPipe(hChildStdoutRd, NULL, 0, NULL, &gotBytes, NULL))
         {
-            closed = true; // child process terminated
+            CloseHandle(hChildStdoutRd); // child process terminated, do not leak handle
+            hChildStdoutRd = INVALID_HANDLE_VALUE;
             break;
         }
         if (!gotBytes) // no data available
@@ -357,21 +548,30 @@ static void poll_child_stdout()
         if (!ReadFile(hChildStdoutRd, buf + len, sizeof(buf)-len-1, &gotBytes, NULL))
         {
             fprintf(stderr, "pipe ReadFile(): error 0x%lx\n", GetLastError());
-            closed = true;
+            CloseHandle(hChildStdoutRd);
+            hChildStdoutRd = INVALID_HANDLE_VALUE;
             break;
         }
         len += gotBytes;
 #else
+        if (hChildStdoutRd < 0)
+            break;
         ssize_t gotBytes;
         gotBytes = read(hChildStdoutRd, buf + len, sizeof(buf)-len-1);
-        if (gotBytes < 0)   // error
+        if (gotBytes == 0)  // child terminated - do not leak handle
+        {
+            close(hChildStdoutRd);
+            hChildStdoutRd = -1;
+        }
+        else if (gotBytes < 0)   // error
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)  // really, no data yet
                 gotBytes = 0;
             else
             {
                 perror("pipe read");
-                closed = true;
+                close(hChildStdoutRd);
+                hChildStdoutRd = -1;
             }
         }
         if (gotBytes <= 0)  // error or no data available
@@ -382,17 +582,64 @@ static void poll_child_stdout()
     }
 }
 
-// Since app does checkpointing in background, monitor modification time
-// of checkpoint file. On change, assume that app has checkpointed.
-static void poll_checkpoint_file(bool report)
+// Get timestamp (usually st_mtime) of checkpoint file for apps which do checkpointing in background.
+// Return 0 if not supported, unknown, or checkpoint state in unconsistent
+time_t SIEVE_FUNCTIONS::get_checkpoint_timestamp(void)
 {
-    static time_t last_time;
     struct stat st;
     static const char file[] = "checkpoint.txt";
 
-    if (stat(file, &st) == 0 && st.st_size != 0 && st.st_mtime != last_time)
+    return (stat(file, &st) == 0 && st.st_size != 0) ? st.st_mtime : 0;
+}
+
+time_t LLR2_FUNCTIONS::get_checkpoint_timestamp(void)
+{
+    struct stat st;
+    static const char *ckpt_file;
+
+    // LLR checkpoints have random names like z123457 ( /^z\d+$/ )
+    // Find suitable file first
+    if (ckpt_file == NULL)
     {
-        last_time = st.st_mtime;
+        DIRREF dir = dir_open(".");
+        if (dir)
+        {
+            char file[512];
+            while (dir_scan(file, dir, sizeof(file)) == 0)
+            {
+                if ((file[0] == 'z' || file[0] == 'Z') && file[1])
+                {
+                    for (char *p = file+1; ; p++)
+                    {
+                        if (*p == 0)  // successfully reached end of string, only digits detected
+                        {
+                            ckpt_file = strdup(file);
+#ifdef VERBOSE
+                            fprintf(stderr, "checkpoint name set to '%s'\n", file);
+#endif
+                        }
+                        if (!isdigit(*p))
+                            break;
+                    }
+                }
+            }
+            dir_close(dir);
+        }
+    }
+
+    return (ckpt_file && stat(ckpt_file, &st) == 0 && st.st_size != 0) ? st.st_mtime : 0;
+}
+
+// Since app does checkpointing in background, monitor modification time
+// of checkpoint file. On change, assume that app has checkpointed.
+static void poll_checkpoint_file(WRAPPER_FUNCTIONS *methods, bool report)
+{
+    static time_t last_time;
+    time_t mtime;
+
+    if ((mtime = methods->get_checkpoint_timestamp()) != 0 && mtime != last_time)
+    {
+        last_time = mtime;
         if (report)
         {
             get_child_cpu_time(checkpoint_offset);
@@ -404,7 +651,7 @@ static void poll_checkpoint_file(bool report)
     }
 }
 
-static bool poll_application(int& status)
+static bool poll_application_exit(int& status)
 {
 #ifdef _WIN32
     DWORD exit_code;
@@ -424,7 +671,6 @@ static bool poll_application(int& status)
     if (wpid > 0)
     {
         status = WEXITSTATUS(stat);
-        get_final_cpu_time();
         return true;
     }
 #endif
@@ -432,21 +678,63 @@ static bool poll_application(int& status)
     return false;
 }
 
+static bool poll_application(int& status, bool main_program)
+{
+    int exit_code;
+
+    if (poll_application_exit(exit_code))
+    {
+        if (main_program)
+            get_final_cpu_time();
+        if (exit_code)
+        {
+            fprintf(stderr, "Application terminated with exit code %d (0x%08X)", exit_code, exit_code);
+            status = EXIT_CHILD_FAILED;
+        }
+        return true;
+    }
+    return false;
+}
+
+//
+// A "Suspening" / "Resuming" pair can produce LOT of output if user selected short
+// inactivity period. Print no more then 10 such messages, then block them for 1 hour.
+//
+static void noisy_message(const char *message)
+{
+    static time_t suspend_until;
+    static int count;
+
+    if (suspend_until)
+    {
+        if (time(NULL) < suspend_until)
+            return;
+        suspend_until = 0;
+    }
+    fputs(message, stderr);
+    if (++count == 10)
+    {
+        fputs("Suspending noisy messages for 1 hour\n", stderr);
+        suspend_until = time(NULL) + 3600;
+        count = 0;
+    }
+}
+
 static void resume_app()
 {
-    fprintf(stderr, "Resuming\n");
+    noisy_message("Resuming\n");
     suspend_or_resume_process(pid, true);
 }
 
 static void stop_app()
 {
-    fprintf(stderr, "Suspending\n");
+    noisy_message("Suspending\n");
     suspend_or_resume_process(pid, false);
 }
 
 // kill this task (gracefully if possible) and any other subprocesses
 // Linux Boinc lib sends SIGTERM, it's OK for sr2sieve
-static void kill_app()
+static void kill_app(WRAPPER_FUNCTIONS *methods)
 {
     fprintf(stderr, "Killing\n");
 #ifdef _WIN32
@@ -459,8 +747,8 @@ static void kill_app()
 #endif
 
     get_final_cpu_time();  // get final CPU time of terminated app
-    poll_child_stdout();   // get remaining messages for logging
-    poll_checkpoint_file(true);
+    poll_child_stdout(methods);   // get remaining messages for logging
+    poll_checkpoint_file(methods, true);
     send_status_message(); // if app checkpointed on exit, send new info
 
     // sr2sieve bug: no output after signal if stdout is redirected, only console works.
@@ -469,31 +757,31 @@ static void kill_app()
 
 // MUST kill app gracefully for correct shutdown and checkpointing
 // For sr2sieve, it's OK to use kill_app() (SIGTERM)
-static void terminate_app()
+static void terminate_app(WRAPPER_FUNCTIONS *methods)
 {
-    kill_app();
+    kill_app(methods);
 }
 
-static void poll_boinc_messages()
+static void poll_boinc_messages(WRAPPER_FUNCTIONS *methods)
 {
     BOINC_STATUS status;
     boinc_get_status(&status);
     if (status.no_heartbeat)
     {
         fprintf(stderr, "Terminating - no heartbeat\n");
-        terminate_app();
+        terminate_app(methods);
         exit(0);
     }
     if (status.quit_request)
     {
         fprintf(stderr, "Terminating - quit request\n");
-        terminate_app();
+        terminate_app(methods);
         exit(0);
     }
     if (status.abort_request)
     {
         fprintf(stderr, "Terminating - abort request\n");
-        kill_app();
+        kill_app(methods);
         exit(EXIT_ABORTED_BY_CLIENT);
     }
     if ( status.suspended && !app_suspended)
@@ -523,120 +811,9 @@ static void send_status_message()
     }
 }
 
-//
-// Poor man's getopt()
-//
-static bool parse_cmdline(int argc, char **argv)
+void SIEVE_FUNCTIONS::postprocess_results(int &status)
 {
-    static const char optstring[] = "?hc:";
-    int i;
-
-    for (i = 1; i < argc; i++)
-    {
-        char *opt = argv[i];
-        const char *idx;
-        char optchar;
-        char *optarg = NULL;
-
-        if (opt[0] != '-' || (idx = strchr(optstring, (optchar = opt[1]))) == NULL || opt[2] != 0)
-        {
-            fprintf(stderr, "Unknown option '%s'. Use '-h' for help\n", opt);
-            return false;
-        }
-        if (idx[1] == ':')
-        {
-            if (++i >= argc)
-            {
-                fprintf(stderr, "Option '%s' requires an argument\n", opt);
-                boinc_finish(EXIT_INIT_FAILURE);
-            }
-            optarg = argv[i];
-        }
-
-        static const char usage_text[] =
-            "Supported options:\n\n"
-            "-c <text>      -- extra command line parameters for main program\n"
-            "                  (may be repeated)\n"
-            "\n"
-            ;
-
-        switch (optchar)
-        {
-        case 'c':
-            vs_ExtraParams.push_back(optarg);
-            break;
-        default:
-            fprintf(stderr, usage_text);
-            fprintf(stdout, usage_text);  // also show to user because stderr redirected to file
-            return false;
-        }
-    }
-    return true;
-}
-
-int main(int argc, char** argv)
-{
-    BOINC_OPTIONS options;
     int retval;
-
-    boinc_init_diagnostics(
-        BOINC_DIAG_DUMPCALLSTACKENABLED |
-        BOINC_DIAG_HEAPCHECKENABLED |
-        BOINC_DIAG_TRACETOSTDERR |
-        BOINC_DIAG_REDIRECTSTDERR
-    );
-
-    fprintf(stderr, "BOINC sr2sieve wrapper 2.00 (" __DATE__ " " __TIME__ ")\n");
-
-    memset(&options, 0, sizeof(options));
-    options.main_program = true;
-    options.check_heartbeat = true;
-    options.handle_process_control = true;
-    boinc_init_options(&options);
-
-    if (parse_cmdline(argc, argv) == false)
-        boinc_finish(EXIT_INIT_FAILURE);
-
-    // Workaround for "finish file present too long" problem
-    if (boinc_file_exists("boinc_finish_called"))
-    {
-        fprintf(stderr, "The job is already completed\n");
-        exit(0);  // standard exit. boinc_finish was already done early
-    }
-
-    // get CPU time spent in previous sessions (really, until checkpoint from which we'll continue)
-    boinc_wu_cpu_time(initial_cpu_time);
-    // get initial timestamp of checkpoint file, if exist
-    poll_checkpoint_file(false);
-
-    retval = run_application();
-    if (retval)
-    {
-        fprintf(stderr, "can't run app: %d\n", retval);
-        boinc_finish(retval);
-    }
-
-    // Main monitoring loop
-
-    int status;
-    for (;;)
-    {
-        bool terminated;
-
-        terminated = poll_application(status);
-
-        // even if terminated, get remaining app output and send message with final CPU time
-        poll_child_stdout();
-        poll_checkpoint_file(true);
-        send_status_message();
-
-        if (terminated)
-            break;
-
-        // finally, process control messages from client
-        poll_boinc_messages();
-        boinc_sleep(1.);
-    }
 
     // Postprocess results
 
@@ -671,6 +848,170 @@ int main(int argc, char** argv)
         else
             fprintf(stderr, "No factors file and range not complete\n");
     }
+}
+
+
+//
+// Poor man's getopt()
+//
+static bool parse_cmdline(int argc, char **argv, WRAPPER_FUNCTIONS * &methods)
+{
+    static const char optstring[] = "?hc:t:";
+    static const char * const longopts[] =
+    {
+        "--llr2",
+        "-:nthreads",  // with argument
+        NULL
+    };
+    int i;
+
+    for (i = 1; i < argc; i++)
+    {
+        char *opt = argv[i];
+        const char *idx;
+        unsigned optchar;
+        char *optarg = NULL;
+
+        // Long option have opcode starting from 256.
+        if (opt[0] == '-' && opt[1] == '-')
+        {
+            // idx[1] points to ':', if option requires an argument
+            for (optchar = 0; (idx = longopts[optchar]) != NULL; optchar++)
+            {
+                if (!strcmp(idx+2, opt+2))
+                {
+                    optchar += 256;
+                    goto have_option;
+                }
+            }
+        }
+
+        if (opt[0] != '-' || (idx = strchr(optstring, (optchar = opt[1]))) == NULL || opt[2] != 0)
+        {
+            fprintf(stderr, "Unknown option '%s'. Use '-h' for help\n", opt);
+            return false;
+        }
+
+have_option:
+        if (idx[1] == ':')
+        {
+            if (++i >= argc)
+            {
+                fprintf(stderr, "Option '%s' requires an argument\n", opt);
+                boinc_finish(EXIT_INIT_FAILURE);
+            }
+            optarg = argv[i];
+        }
+
+        static const char usage_text[] =
+            "Supported options:\n\n"
+            "--llr2         -- llr2 mode (default: srsieve)\n"
+            "--nthreads N   -- number of threads for multi-threaded apps (llr2)\n"
+            "\n"
+            "-t N           -- same as --nthreads\n"
+            "-c <text>      -- extra command line parameters for main program\n"
+            "                  (may be repeated)\n"
+            "\n"
+            ;
+
+        switch (optchar)
+        {
+        case 'c':
+            vs_ExtraParams.push_back(optarg);
+            break;
+        case 't': case 257: // --nthreads
+            num_threads = atoi(optarg);
+            break;
+        case 256:  // --llr2
+            methods = &methods_llr2;
+            break;
+        default:
+            fprintf(stderr, usage_text);
+            fprintf(stdout, usage_text);  // also show to user because stderr redirected to file
+            return false;
+        }
+    }
+    return true;
+}
+
+int main(int argc, char** argv)
+{
+    BOINC_OPTIONS options;
+    int retval;
+
+    WRAPPER_FUNCTIONS *methods = &methods_sieve;
+
+#ifndef _WIN32
+    // Close good amount of possibly opened (inherited) handles except standard 0-2
+    // (stdin, stdout, stderr) to avoid handle-inheritance-on-exec bug in older Boinc clients
+    // https://github.com/BOINC/boinc/issues/1388
+    for (int i = 3; i < 100; i++)
+        close(i);
+#endif
+
+    boinc_init_diagnostics(
+        BOINC_DIAG_DUMPCALLSTACKENABLED |
+        BOINC_DIAG_HEAPCHECKENABLED |
+        BOINC_DIAG_TRACETOSTDERR |
+        BOINC_DIAG_REDIRECTSTDERR
+    );
+
+    fprintf(stderr, "BOINC PrimeGrid wrapper 2.01 (" __DATE__ " " __TIME__ ")\n");
+
+    memset(&options, 0, sizeof(options));
+    options.main_program = true;
+    options.check_heartbeat = true;
+    options.handle_process_control = true;
+    boinc_init_options(&options);
+
+    if (parse_cmdline(argc, argv, methods) == false)
+        boinc_finish(EXIT_INIT_FAILURE);
+
+    // Workaround for "finish file present too long" problem
+    if (!boinc_is_standalone() && boinc_file_exists("boinc_finish_called"))
+    {
+        fprintf(stderr, "The job is already completed\n");
+        exit(0);  // standard exit. boinc_finish was already done early
+    }
+
+    // get CPU time spent in previous sessions (really, until checkpoint from which we'll continue)
+    boinc_wu_cpu_time(initial_cpu_time);
+    // get initial timestamp of checkpoint file, if exist
+    poll_checkpoint_file(methods, false);
+
+    retval = run_application(methods);
+    if (retval)
+    {
+        fprintf(stderr, "can't run app: %d\n", retval);
+        boinc_finish(retval);
+    }
+
+    // Main monitoring loop
+
+    int status;
+    for (;;)
+    {
+        bool terminated;
+
+        terminated = poll_application(status, true);
+
+        // even if terminated, get remaining app output and send message with final CPU time
+        poll_child_stdout(methods);
+        poll_checkpoint_file(methods, true);
+        send_status_message();
+
+        if (terminated)
+            break;
+
+        // finally, process control messages from client
+        poll_boinc_messages(methods);
+        boinc_sleep(1.);
+    }
+    execute_cleanup();
+
+    // Postprocess results
+
+    methods->postprocess_results(status);
 
     // Done
     boinc_finish(status);
