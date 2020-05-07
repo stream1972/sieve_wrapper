@@ -688,7 +688,7 @@ static bool poll_application(int& status, bool main_program)
             get_final_cpu_time();
         if (exit_code)
         {
-            fprintf(stderr, "Application terminated with exit code %d (0x%08X)", exit_code, exit_code);
+            fprintf(stderr, "Application terminated with exit code %d (0x%08X)\n", exit_code, exit_code);
             status = EXIT_CHILD_FAILED;
         }
         return true;
