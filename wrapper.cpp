@@ -937,7 +937,6 @@ have_option:
 int main(int argc, char** argv)
 {
     BOINC_OPTIONS options;
-    int retval;
 
     WRAPPER_FUNCTIONS *methods = &methods_sieve;
 
@@ -979,16 +978,17 @@ int main(int argc, char** argv)
     // get initial timestamp of checkpoint file, if exist
     poll_checkpoint_file(methods, false);
 
-    retval = run_application(methods);
-    if (retval)
+    int status;
+
+    status = run_application(methods);
+    if (status)
     {
-        fprintf(stderr, "can't run app: %d\n", retval);
-        boinc_finish(retval);
+        fprintf(stderr, "can't run app: %d\n", status);
+        boinc_finish(status);
     }
 
     // Main monitoring loop
 
-    int status;
     for (;;)
     {
         bool terminated;
