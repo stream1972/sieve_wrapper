@@ -15,6 +15,8 @@
 #include <fcntl.h>        // fcntl()
 #endif
 
+#define API_VERSION (BOINC_MAJOR_VERSION * 10000 + BOINC_MINOR_VERSION * 100 + BOINC_RELEASE)
+
 using namespace std;
 
 #ifdef _WIN32
@@ -33,9 +35,10 @@ static double final_cpu_time;      // optional, obtained when app terminates
 static double checkpoint_offset;   // when app checkpointed (in this session)
 static bool   status_updated;      // must report new info
 static unsigned num_threads;       // set by Boinc for multi-threaded apps
-static bool   range_complete;
 
 static vector<string> vs_ExtraParams;
+
+static APP_INIT_DATA aid;          // misc task startup info, not accessible by other means
 
 //
 // Abstract application interface
@@ -60,6 +63,9 @@ public:
     // and task must be aborted, otherwise it must be kept unchanged.
     virtual void postprocess_results(int &status) = 0;
 
+    // Get trickle name for periodical progress report, or NULL if trickles are not supported
+    virtual const char *get_trickle_name(void) { return NULL; }
+
 };
 
 static void send_status_message();
@@ -73,11 +79,14 @@ static void poll_child_stdout(WRAPPER_FUNCTIONS *methods);
 //
 class SIEVE_FUNCTIONS : public WRAPPER_FUNCTIONS
 {
+private:
+    bool   range_complete;
 public:
     void   get_application_name(string &sMainProgram);
     bool   parse_child_stdout_line(char *buf);
     time_t get_checkpoint_timestamp(void);
     void   postprocess_results(int &status);
+    SIEVE_FUNCTIONS() : range_complete(false) {}
 };
 
 class LLR2_FUNCTIONS : public WRAPPER_FUNCTIONS
@@ -87,6 +96,7 @@ public:
     bool   parse_child_stdout_line(char *buf);
     time_t get_checkpoint_timestamp(void);
     void   postprocess_results(int & /* status */) { };
+    const char *get_trickle_name(void) { return "llr_progress"; }
 };
 
 static SIEVE_FUNCTIONS methods_sieve;
@@ -155,8 +165,6 @@ void LLR2_FUNCTIONS::get_application_name(string &sMainProgram)
     }
 
     // LLR checkpoint interval
-    APP_INIT_DATA aid;
-    boinc_get_init_data(aid);
     unsigned cp = aid.checkpoint_period >= 1 ? (unsigned)aid.checkpoint_period : DEFAULT_CHECKPOINT_PERIOD;
     sprintf(buf, "-oDiskWriteTime=%u", (cp + 59) / 60);
     vs_ExtraParams.push_back(buf);
@@ -811,6 +819,77 @@ static void send_status_message()
     }
 }
 
+#define TRICKLE_PERIOD             (24 * 3600)   // Send trickles each 24 hours
+#define TRICKLE_FIRST_REPORT_DELAY (10 * 60)     // Send first trickle if task is running more then 10 minutes
+
+static const char trickle_file[] = "trickle_ts.txt";
+
+static void save_trickle_file(time_t ts)
+{
+    FILE *f = fopen(trickle_file, "wt");
+    if (f)
+    {
+        fprintf(f, "%ld\n", (long)ts);
+        fclose(f);
+    }
+}
+
+static void send_trickle_message(WRAPPER_FUNCTIONS *methods)
+{
+    static time_t last_trickle_time;
+    const char *variety = methods->get_trickle_name();
+
+    if (variety == NULL) return;
+
+    time_t now = time(NULL);
+
+    // On first run, try to load saved timestamp of last trickle
+    if (last_trickle_time == 0)
+    {
+        FILE *f = fopen(trickle_file, "rt");
+        if (f)
+        {
+            long tmp;
+            if (fscanf(f, "%ld", &tmp) == 1)
+                last_trickle_time = tmp;
+            fclose(f);
+        }
+        // If no trickles were sent yet, schedule it to be sent few minutes after start
+        // (to be sure that task started up just fine). Otherwise, if Boinc starts a
+        // task too close to deadline and did't finish it in time (wrong completion estimate
+        // or paused by user), server will be not aware that task is running and will
+        // resend potentially good task.
+        if (last_trickle_time == 0)
+        {
+            last_trickle_time = now - TRICKLE_PERIOD + TRICKLE_FIRST_REPORT_DELAY;
+            save_trickle_file(last_trickle_time);
+        }
+    }
+
+    // Time to send new trickle?
+    if (now - last_trickle_time >= TRICKLE_PERIOD && ratio_done >= 0)
+    {
+        char buf[512];
+        static double session_cpu_time;  // keep old time on error
+
+        get_child_cpu_time(session_cpu_time);  // unchanged on error
+        snprintf(buf, sizeof(buf),
+            "<trickle_up>\n"
+            "   <progress>%f</progress>\n"
+            "   <cputime>%f</cputime>\n"
+            "   <runtime>%f</runtime>\n"
+            "</trickle_up>\n",
+            ratio_done,
+            initial_cpu_time + session_cpu_time,
+            aid.starting_elapsed_time + boinc_elapsed_time()
+        );
+        boinc_send_trickle_up((char *)variety, buf);
+
+        last_trickle_time = now;
+        save_trickle_file(last_trickle_time);
+    }
+}
+
 void SIEVE_FUNCTIONS::postprocess_results(int &status)
 {
     int retval;
@@ -961,7 +1040,13 @@ int main(int argc, char** argv)
     options.main_program = true;
     options.check_heartbeat = true;
     options.handle_process_control = true;
+#if API_VERSION < 70500   /* Didn't tested myself, but at least 7.11 really have no such field */
+    options.handle_trickle_ups = true;
+#endif
     boinc_init_options(&options);
+
+    // get a copy of full Boinc startup data
+    boinc_get_init_data(aid);
 
     if (parse_cmdline(argc, argv, methods) == false)
         boinc_finish(EXIT_INIT_FAILURE);
@@ -1005,6 +1090,7 @@ int main(int argc, char** argv)
 
         // finally, process control messages from client
         poll_boinc_messages(methods);
+        send_trickle_message(methods);
         boinc_sleep(1.);
     }
     execute_cleanup();
