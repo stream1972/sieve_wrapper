@@ -71,7 +71,7 @@ public:
 static void send_status_message();
 static int  execute_program(string sMainProgram, vector<string> &vs_ExtraParams);
 static void execute_cleanup(void);
-static bool poll_application(int& status, bool main_program);
+static bool poll_application(int& status, bool main_program, bool &abnormal_termination);
 static void poll_child_stdout(WRAPPER_FUNCTIONS *methods);
 
 //
@@ -179,9 +179,9 @@ void LLR2_FUNCTIONS::get_application_name(string &sMainProgram)
     {
         for (;;)
         {
-            bool terminated;
+            bool terminated, ab;
 
-            terminated = poll_application(status, false);
+            terminated = poll_application(status, false, ab);
             poll_child_stdout(this); // even if terminated, get remaining app output
             if (terminated)
                 break;
@@ -264,6 +264,7 @@ static int execute_program(string sMainProgram, vector<string> &vs_ExtraParams)
         &startup_info,
         &process_info
     )) {
+        fprintf(stderr, "CreateProcess() failed: GetLastError()=0x%08lX\n", (ULONG)GetLastError());
         free(args);
         return ERR_EXEC;
     }
@@ -659,14 +660,17 @@ static void poll_checkpoint_file(WRAPPER_FUNCTIONS *methods, bool report)
     }
 }
 
-static bool poll_application_exit(int& status)
+static bool poll_application_exit(int& status, bool& abnormal)
 {
+    abnormal = false;
 #ifdef _WIN32
     DWORD exit_code;
     if (GetExitCodeProcess(pid_handle, &exit_code))
     {
         if (exit_code == STILL_ACTIVE)
             return false;
+        if ((exit_code & 0xC0000000) == 0xC0000000)  // try to catch exceptions / GPF / system shutdown
+            abnormal = true;
         status = exit_code;
         return true;
     }
@@ -678,7 +682,17 @@ static bool poll_application_exit(int& status)
         return false;
     if (wpid > 0)
     {
-        status = WEXITSTATUS(stat);
+        if (WIFEXITED(stat))
+            status = WEXITSTATUS(stat);
+        else
+        {
+            abnormal = true;
+            status   = 0;
+            if (WIFSIGNALED(stat))
+                fprintf(stderr, "Application terminated by signal %d\n", WTERMSIG(stat));
+            else
+                fprintf(stderr, "Application terminated by unknown reason\n");
+        }
         return true;
     }
 #endif
@@ -686,11 +700,11 @@ static bool poll_application_exit(int& status)
     return false;
 }
 
-static bool poll_application(int& status, bool main_program)
+static bool poll_application(int& status, bool main_program, bool& abnormal_termination)
 {
     int exit_code;
 
-    if (poll_application_exit(exit_code))
+    if (poll_application_exit(exit_code, abnormal_termination))
     {
         if (main_program)
             get_final_cpu_time();
@@ -1074,11 +1088,12 @@ int main(int argc, char** argv)
 
     // Main monitoring loop
 
+    bool abnormal_termination;
     for (;;)
     {
         bool terminated;
 
-        terminated = poll_application(status, true);
+        terminated = poll_application(status, true, abnormal_termination);
 
         // even if terminated, get remaining app output and send message with final CPU time
         poll_child_stdout(methods);
@@ -1094,6 +1109,11 @@ int main(int argc, char** argv)
         boinc_sleep(1.);
     }
     execute_cleanup();
+
+    // If application crashed or killed, attempt to restart it
+
+    if (abnormal_termination)
+        boinc_temporary_exit(5, "Attempting to restart failed application");
 
     // Postprocess results
 
