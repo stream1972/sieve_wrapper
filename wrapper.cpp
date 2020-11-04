@@ -56,7 +56,8 @@ public:
 
     // Get timestamp (usually st_mtime) of checkpoint file for apps which do checkpointing in background.
     // Return 0 if not supported, unknown, or checkpoint state in unconsistent
-    virtual time_t get_checkpoint_timestamp(void) = 0;
+    // If 'now' is true, function must not ignore this request.
+    virtual time_t get_checkpoint_timestamp(bool now) = 0;
 
     // Task finished. Postprocess result files (check, copy to destination, etc.).
     // 'status' is current error code. Function can set it if fatal error occured
@@ -84,7 +85,7 @@ private:
 public:
     void   get_application_name(string &sMainProgram);
     bool   parse_child_stdout_line(char *buf);
-    time_t get_checkpoint_timestamp(void);
+    time_t get_checkpoint_timestamp(bool);
     void   postprocess_results(int &status);
     SIEVE_FUNCTIONS() : range_complete(false) {}
 };
@@ -94,7 +95,7 @@ class LLR2_FUNCTIONS : public WRAPPER_FUNCTIONS
 public:
     void   get_application_name(string &sMainProgram);
     bool   parse_child_stdout_line(char *buf);
-    time_t get_checkpoint_timestamp(void);
+    time_t get_checkpoint_timestamp(bool);
     void   postprocess_results(int & /* status */) { };
     const char *get_trickle_name(void) { return "llr_progress"; }
 };
@@ -593,7 +594,7 @@ static void poll_child_stdout(WRAPPER_FUNCTIONS *methods)
 
 // Get timestamp (usually st_mtime) of checkpoint file for apps which do checkpointing in background.
 // Return 0 if not supported, unknown, or checkpoint state in unconsistent
-time_t SIEVE_FUNCTIONS::get_checkpoint_timestamp(void)
+time_t SIEVE_FUNCTIONS::get_checkpoint_timestamp(bool)
 {
     struct stat st;
     static const char file[] = "checkpoint.txt";
@@ -601,52 +602,98 @@ time_t SIEVE_FUNCTIONS::get_checkpoint_timestamp(void)
     return (stat(file, &st) == 0 && st.st_size != 0) ? st.st_mtime : 0;
 }
 
-time_t LLR2_FUNCTIONS::get_checkpoint_timestamp(void)
+time_t LLR2_FUNCTIONS::get_checkpoint_timestamp(bool now)
 {
     struct stat st;
-    static const char *ckpt_file;
 
-    // LLR checkpoints have random names like z123457 ( /^z\d+$/ )
-    // Find suitable file first
-    if (ckpt_file == NULL)
+    /*
+    LLR2 uses 5 different types of checkpoints and very complex logic to choose from :(
+    1-4: [zrwv]\d+  (standard, Gerbicz recovery, same for ValidateCert)
+      5: proofname.\d+
+
+    It's impossible to say which checkpoint will be used first. It depends on checkpoint
+    time set in Boinc preferences, test size and number of Gerbicz checkpoints selected.
+
+    Full scan for all possible files in directory is necessary. A file with latest
+    timestamp wins. To reduce load, scan is performed every 5 seconds (default poll interval
+    is 1 second). It may introduce small bias in recorded CPU time but I think it's
+    acceptable.
+
+    Since 'proofname' part is generally unknown, it's safe to search for 'proofname.\d+.md5'
+    file which is saved along with main proof.
+    */
+
+    static unsigned delay;
+    if (delay && !now)
     {
-        DIRREF dir = dir_open(".");
-        if (dir)
+        delay--;
+        return 0;
+    }
+    delay = 5;
+
+    // Find suitable file first
+    time_t best_mtime = 0;
+    DIRREF dir = dir_open(".");
+    if (dir)
+    {
+        char file[512];
+        while (dir_scan(file, dir, sizeof(file)) == 0)
         {
-            char file[512];
-            while (dir_scan(file, dir, sizeof(file)) == 0)
+            bool found = false;
+            char *p;
+
+            if (strchr("zZrRvVwW", file[0]) && file[1])
             {
-                if ((file[0] == 'z' || file[0] == 'Z') && file[1])
+                for (p = file+1; ; p++)
                 {
-                    for (char *p = file+1; ; p++)
-                    {
-                        if (*p == 0)  // successfully reached end of string, only digits detected
-                        {
-                            ckpt_file = strdup(file);
-#ifdef VERBOSE
-                            fprintf(stderr, "checkpoint name set to '%s'\n", file);
-#endif
-                        }
-                        if (!isdigit(*p))
-                            break;
-                    }
+                    if (*p == 0)  // successfully reached end of string, only digits detected
+                        found = true;
+                    if (!isdigit(*p))
+                        break;
                 }
             }
-            dir_close(dir);
+
+            if ((p = strstr(file, ".md5")) != NULL && p != file && p[4] == 0)
+            {
+                for (--p; ; p--)
+                {
+                    if (*p == '.')  // successfully reached previous part ('proof.'), only digits detected
+                        found = true;
+                    if (!isdigit(*p) || p == file)
+                        break;
+                }
+            }
+
+            if (found)
+            {
+#ifdef VERBOSE
+                fprintf(stderr, "checkpoint file check '%s'\n", file);
+#endif
+                if (stat(file, &st) == 0 && st.st_size != 0 && st.st_mtime > best_mtime)
+                {
+#ifdef VERBOSE
+                    fprintf(stderr, "new best mtime %u > %u\n", (unsigned)st.st_mtime, (unsigned)best_mtime);
+#endif
+                    best_mtime = st.st_mtime;
+                }
+            }
+
         }
+        dir_close(dir);
     }
 
-    return (ckpt_file && stat(ckpt_file, &st) == 0 && st.st_size != 0) ? st.st_mtime : 0;
+    return best_mtime;
 }
+
 
 // Since app does checkpointing in background, monitor modification time
 // of checkpoint file. On change, assume that app has checkpointed.
-static void poll_checkpoint_file(WRAPPER_FUNCTIONS *methods, bool report)
+static void poll_checkpoint_file(WRAPPER_FUNCTIONS *methods, bool report, bool now)
 {
     static time_t last_time;
     time_t mtime;
 
-    if ((mtime = methods->get_checkpoint_timestamp()) != 0 && mtime != last_time)
+    if ((mtime = methods->get_checkpoint_timestamp(now)) != 0 && mtime != last_time)
     {
         last_time = mtime;
         if (report)
@@ -770,7 +817,7 @@ static void kill_app(WRAPPER_FUNCTIONS *methods)
 
     get_final_cpu_time();  // get final CPU time of terminated app
     poll_child_stdout(methods);   // get remaining messages for logging
-    poll_checkpoint_file(methods, true);
+    poll_checkpoint_file(methods, true, true);
     send_status_message(); // if app checkpointed on exit, send new info
 
     // sr2sieve bug: no output after signal if stdout is redirected, only console works.
@@ -1048,7 +1095,7 @@ int main(int argc, char** argv)
         BOINC_DIAG_REDIRECTSTDERR
     );
 
-    fprintf(stderr, "BOINC PrimeGrid wrapper 2.01 (" __DATE__ " " __TIME__ ")\n");
+    fprintf(stderr, "BOINC PrimeGrid wrapper 2.02 (" __DATE__ " " __TIME__ ")\n");
 
     memset(&options, 0, sizeof(options));
     options.main_program = true;
@@ -1075,7 +1122,7 @@ int main(int argc, char** argv)
     // get CPU time spent in previous sessions (really, until checkpoint from which we'll continue)
     boinc_wu_cpu_time(initial_cpu_time);
     // get initial timestamp of checkpoint file, if exist
-    poll_checkpoint_file(methods, false);
+    poll_checkpoint_file(methods, false, true);
 
     int status;
 
@@ -1097,7 +1144,7 @@ int main(int argc, char** argv)
 
         // even if terminated, get remaining app output and send message with final CPU time
         poll_child_stdout(methods);
-        poll_checkpoint_file(methods, true);
+        poll_checkpoint_file(methods, true, false);
         send_status_message();
 
         if (terminated)
