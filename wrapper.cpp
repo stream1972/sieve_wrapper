@@ -720,7 +720,7 @@ static bool poll_application(int& status, bool main_program, bool& abnormal_term
 
 //
 // A "Suspening" / "Resuming" pair can produce LOT of output if user selected short
-// inactivity period. Print no more then 10 such messages, then block them for 1 hour.
+// inactivity period. Print only few such messages, then block them for a while.
 //
 static void noisy_message(const char *message)
 {
@@ -734,10 +734,10 @@ static void noisy_message(const char *message)
         suspend_until = 0;
     }
     fputs(message, stderr);
-    if (++count == 10)
+    if (++count == 6)
     {
-        fputs("Suspending noisy messages for 1 hour\n", stderr);
-        suspend_until = time(NULL) + 3600;
+        fputs("Suspending noisy messages for 4 hours\n", stderr);
+        suspend_until = time(NULL) + 3600*4;
         count = 0;
     }
 }
