@@ -504,7 +504,7 @@ bool LLR2_FUNCTIONS::parse_child_stdout_line(char *buf)
 
 static void poll_child_stdout(WRAPPER_FUNCTIONS *methods)
 {
-    static char buf[512];
+    static char buf[2048];  // GFN-11-MEGA has lines up to 600 characters
     static unsigned len;
 
     for (;;)
